@@ -26,6 +26,7 @@ using QuantConnect.Logging;
 using QuantConnect.Securities;
 using QuantConnect.Util;
 using QuantConnect.Data.Fundamental;
+using QuantConnect.Packets;
 
 namespace QuantConnect.Lean.Engine.DataFeeds
 {
@@ -44,6 +45,7 @@ namespace QuantConnect.Lean.Engine.DataFeeds
         private readonly InternalSubscriptionManager _internalSubscriptionManager;
         private bool _initializedSecurityBenchmark;
         private readonly IDataProvider _dataProvider;
+        private readonly ParallelOptions _fineSelectionParallelism;
         private bool _anyDoesNotHaveFundamentalDataWarningLogged;
 
         /// <summary>
@@ -53,12 +55,14 @@ namespace QuantConnect.Lean.Engine.DataFeeds
         /// <param name="securityService">The security service</param>
         /// <param name="dataPermissionManager">The data permissions manager</param>
         /// <param name="dataProvider">The data provider to use</param>
+        /// <param name="controls">The algorithms controls to use if any</param>
         /// <param name="internalConfigResolution">The resolution to use for internal configuration</param>
         public UniverseSelection(
             IAlgorithm algorithm,
             ISecurityService securityService,
             IDataPermissionManager dataPermissionManager,
             IDataProvider dataProvider,
+            Controls controls = null,
             Resolution internalConfigResolution = Resolution.Minute)
         {
             _dataProvider = dataProvider;
@@ -66,6 +70,15 @@ namespace QuantConnect.Lean.Engine.DataFeeds
             _securityService = securityService;
             _dataPermissionManager = dataPermissionManager;
             _pendingRemovalsManager = new PendingRemovalsManager(algorithm.Transactions);
+
+            // there's a lot of file loading so we are generous with the level of parallelism
+            var parallelismLevel = Environment.ProcessorCount * 2;
+            if (controls != null && controls.CpuAllocation != 0)
+            {
+                parallelismLevel = (int) Math.Ceiling(controls.CpuAllocation * 2);
+            }
+            _fineSelectionParallelism = new ParallelOptions { MaxDegreeOfParallelism = parallelismLevel };
+
             _currencySubscriptionDataConfigManager = new CurrencySubscriptionDataConfigManager(algorithm.Portfolio.CashBook,
                 algorithm.Securities,
                 algorithm.SubscriptionManager,
@@ -124,19 +137,24 @@ namespace QuantConnect.Lean.Engine.DataFeeds
                     // prepare a BaseDataCollection of FineFundamental instances
                     var fineCollection = new BaseDataCollection();
 
+                    var coarseData = new Dictionary<Symbol, CoarseFundamental>(universeData.Data.Count);
                     // Create a dictionary of CoarseFundamental keyed by Symbol that also has FineFundamental
                     // Coarse raw data has SID collision on: CRHCY R735QTJ8XC9X
-                    var allCoarse = universeData.Data.OfType<CoarseFundamental>();
-                    var coarseData = allCoarse.Where(c => c.HasFundamentalData)
-                        .DistinctBy(c => c.Symbol)
-                        .ToDictionary(c => c.Symbol);
+                    for (var i = 0; i < universeData.Data.Count; i++)
+                    {
+                        var coarse = universeData.Data[i] as CoarseFundamental;
+                        if (coarse != null && coarse.HasFundamentalData)
+                        {
+                            coarseData[coarse.Symbol] = coarse;
+                        }
+                    }
 
                     // Remove selected symbols that does not have fine fundamental data
                     var anyDoesNotHaveFundamentalData = false;
                     // only pre filter selected symbols if there actually is any coarse data. This way we can support custom universe filtered by fine fundamental data
                     // which do not use coarse data as underlying, in which case it could happen that we try to load fine fundamental data that is missing, but no problem,
                     // 'FineFundamentalSubscriptionEnumeratorFactory' won't emit it
-                    if (allCoarse.Any())
+                    if (coarseData.Count > 0)
                     {
                         selectSymbolsResult = selectSymbolsResult
                             .Where(
@@ -155,29 +173,8 @@ namespace QuantConnect.Lean.Engine.DataFeeds
                         _anyDoesNotHaveFundamentalDataWarningLogged = true;
                     }
 
-                    // use all available threads, the entire system is waiting for this to complete
-                    var options = new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount };
-                    Parallel.ForEach(selectSymbolsResult, options, symbol =>
-                    {
-                        var config = FineFundamentalUniverse.CreateConfiguration(symbol);
-                        var security = _securityService.CreateSecurity(symbol,
-                            config,
-                            addToSymbolCache: false);
-
-                        var localStartTime = dateTimeUtc.ConvertFromUtc(config.ExchangeTimeZone).AddDays(-1);
-                        var factory = new FineFundamentalSubscriptionEnumeratorFactory(_algorithm.LiveMode, x => new[] { localStartTime });
-                        var request = new SubscriptionRequest(true, universe, security, new SubscriptionDataConfig(config), localStartTime, localStartTime);
-                        using (var enumerator = factory.CreateEnumerator(request, _dataProvider))
-                        {
-                            if (enumerator.MoveNext())
-                            {
-                                lock (fineCollection.Data)
-                                {
-                                    fineCollection.Data.Add(enumerator.Current);
-                                }
-                            }
-                        }
-                    });
+                    var localStartTime = dateTimeUtc.ConvertFromUtc(TimeZones.NewYork).AddDays(-1);
+                    var factory = new FineFundamentalSubscriptionEnumeratorFactory(_algorithm.LiveMode, x => new[] { localStartTime });
 
                     // WARNING -- HACK ATTACK -- WARNING
                     // Fine universes are considered special due to their chaining behavior.
@@ -186,45 +183,65 @@ namespace QuantConnect.Lean.Engine.DataFeeds
                     // in place for this function to return such data. The following lines are tightly coupled
                     // to the universeData dictionaries in SubscriptionSynchronizer and LiveTradingDataFeed and
                     // rely on reference semantics to work.
-
                     universeData.Data = new List<BaseData>();
-                    foreach (var fine in fineCollection.Data.OfType<FineFundamental>())
+
+                    // use all available threads, the entire system is waiting for this to complete
+                    Parallel.ForEach(selectSymbolsResult, _fineSelectionParallelism, symbol =>
                     {
-                        var fundamentals = new Fundamentals
-                        {
-                            Symbol = fine.Symbol,
-                            Time = fine.Time,
-                            EndTime = fine.EndTime,
-                            DataType = fine.DataType,
-                            AssetClassification = fine.AssetClassification,
-                            CompanyProfile = fine.CompanyProfile,
-                            CompanyReference = fine.CompanyReference,
-                            EarningReports = fine.EarningReports,
-                            EarningRatios = fine.EarningRatios,
-                            FinancialStatements = fine.FinancialStatements,
-                            OperationRatios = fine.OperationRatios,
-                            SecurityReference = fine.SecurityReference,
-                            ValuationRatios = fine.ValuationRatios,
-                            Market = fine.Symbol.ID.Market
-                        };
+                        var config = FineFundamentalUniverse.CreateConfiguration(symbol);
+                        var security = _securityService.CreateSecurity(symbol,
+                            config,
+                            addToSymbolCache: false);
 
-                        CoarseFundamental coarse;
-                        if (coarseData.TryGetValue(fine.Symbol, out coarse))
+                        var request = new SubscriptionRequest(true, universe, security, new SubscriptionDataConfig(config), localStartTime, localStartTime);
+                        using (var enumerator = factory.CreateEnumerator(request, _dataProvider))
                         {
-                            // the only time the coarse data won't exist is if the selection function
-                            // doesn't use the data provided, and instead returns a constant list of
-                            // symbols -- coupled with a potential hole in the data
-                            fundamentals.Value = coarse.Value;
-                            fundamentals.Volume = coarse.Volume;
-                            fundamentals.DollarVolume = coarse.DollarVolume;
-                            fundamentals.HasFundamentalData = coarse.HasFundamentalData;
+                            if (enumerator.MoveNext())
+                            {
+                                var fine = (FineFundamental)enumerator.Current;
 
-                            // set the fine fundamental price property to yesterday's closing price
-                            fine.Value = coarse.Value;
+                                var fundamentals = new Fundamentals
+                                {
+                                    Symbol = fine.Symbol,
+                                    Time = fine.Time,
+                                    EndTime = fine.EndTime,
+                                    DataType = fine.DataType,
+                                    AssetClassification = fine.AssetClassification,
+                                    CompanyProfile = fine.CompanyProfile,
+                                    CompanyReference = fine.CompanyReference,
+                                    EarningReports = fine.EarningReports,
+                                    EarningRatios = fine.EarningRatios,
+                                    FinancialStatements = fine.FinancialStatements,
+                                    OperationRatios = fine.OperationRatios,
+                                    SecurityReference = fine.SecurityReference,
+                                    ValuationRatios = fine.ValuationRatios,
+                                    Market = fine.Symbol.ID.Market
+                                };
+
+                                // concurrently reading from this dictionary is thread safe as long as no one is modifying it, which is this case
+                                CoarseFundamental coarse;
+                                if (coarseData.TryGetValue(fine.Symbol, out coarse))
+                                {
+                                    // the only time the coarse data won't exist is if the selection function
+                                    // doesn't use the data provided, and instead returns a constant list of
+                                    // symbols -- coupled with a potential hole in the data
+                                    fundamentals.Value = coarse.Value;
+                                    fundamentals.Volume = coarse.Volume;
+                                    fundamentals.DollarVolume = coarse.DollarVolume;
+                                    fundamentals.HasFundamentalData = coarse.HasFundamentalData;
+
+                                    // set the fine fundamental price property to yesterday's closing price
+                                    fine.Value = coarse.Value;
+                                }
+
+                                lock (fineCollection.Data)
+                                {
+                                    fineCollection.Data.Add(fine);
+                                    universeData.Data.Add(fundamentals);
+                                }
+                            }
                         }
-
-                        universeData.Data.Add(fundamentals);
-                    }
+                    });
 
                     // END -- HACK ATTACK -- END
 

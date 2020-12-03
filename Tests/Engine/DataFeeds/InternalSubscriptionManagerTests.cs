@@ -333,6 +333,7 @@ namespace QuantConnect.Tests.Engine.DataFeeds
                 securityService,
                 new DataPermissionManager(),
                 new DefaultDataProvider(),
+                null,
                 Resolution.Second);
             _dataManager = new DataManager(_dataFeed, universeSelection, _algorithm, new TimeKeeper(DateTime.UtcNow, TimeZones.NewYork),
                 MarketHoursDatabase.FromDataFolder(),
