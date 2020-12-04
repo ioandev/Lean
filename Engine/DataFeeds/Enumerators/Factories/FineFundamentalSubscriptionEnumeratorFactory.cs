@@ -106,10 +106,10 @@ namespace QuantConnect.Lean.Engine.DataFeeds.Enumerators.Factories
         {
             var source = fine.GetSource(config, date, _isLiveMode);
 
-            if (File.Exists(source.Source))
-            {
-                return source;
-            }
+            //if (File.Exists(source.Source))
+            //{
+            //    return source;
+            //}
 
             if (_isLiveMode)
             {
