@@ -24,6 +24,7 @@ using QuantConnect.Data;
 using QuantConnect.Data.Fundamental;
 using QuantConnect.Data.UniverseSelection;
 using QuantConnect.Interfaces;
+using QuantConnect.Logging;
 
 namespace QuantConnect.Lean.Engine.DataFeeds.Enumerators.Factories
 {
@@ -104,12 +105,14 @@ namespace QuantConnect.Lean.Engine.DataFeeds.Enumerators.Factories
         /// </summary>
         private SubscriptionDataSource GetSource(FineFundamental fine, SubscriptionDataConfig config, DateTime date)
         {
+            Log.Trace($"Start: {config.Symbol}");
             var source = fine.GetSource(config, date, _isLiveMode);
 
-            if (File.Exists(source.Source))
-            {
-                return source;
-            }
+            //if (File.Exists(source.Source))
+            //{
+            //    Log.Trace($"End1: {config.Symbol}");
+            //    return source;
+            //}
 
             var cacheKey = config.Symbol.Value.ToLowerInvariant().GetHashCode();
             List<DateTime> availableDates;
@@ -152,6 +155,7 @@ namespace QuantConnect.Lean.Engine.DataFeeds.Enumerators.Factories
                         // only add to cache if not live mode
                         FineFilesCache[cacheKey] = new List<DateTime>();
                     }
+                    Log.Trace($"End2: {config.Symbol}");
                     return source;
                 }
 
@@ -165,6 +169,7 @@ namespace QuantConnect.Lean.Engine.DataFeeds.Enumerators.Factories
             // requested date before first date, return null source
             if (availableDates.Count == 0 || date < availableDates[0])
             {
+                Log.Trace($"End3: {config.Symbol}");
                 return source;
             }
             for (var i = availableDates.Count - 1; i >= 0; i--)
@@ -172,10 +177,12 @@ namespace QuantConnect.Lean.Engine.DataFeeds.Enumerators.Factories
                 // we iterate backwards ^ and find the first data point before 'date'
                 if (availableDates[i] <= date)
                 {
+                    Log.Trace($"End4: {config.Symbol}");
                     return fine.GetSource(config, availableDates[i], _isLiveMode);
                 }
             }
 
+            Log.Trace($"End5: {config.Symbol}");
             return source;
         }
     }
